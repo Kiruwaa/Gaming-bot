@@ -118,18 +118,25 @@ async def on_member_join(member: discord.Member):
         embed.set_footer(text=member.guild.name)
         await channel.send(embed=embed)
 
+# Mapping emoji -> rôle pour le canal #rôles (sans dépendre du message ID)
+EMOJI_ROLE_MAP = {
+    "🎮": "Gamer",
+}
+
 @bot.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
-    """Ajoute un rôle quand un membre réagit au message de rôles."""
-    msg_id = str(payload.message_id)
-    if msg_id not in REACTION_ROLES:
-        return
-    emoji = str(payload.emoji)
-    role_name = REACTION_ROLES[msg_id].get(emoji)
-    if not role_name:
+    """Ajoute un rôle quand un membre réagit dans #rôles."""
+    if payload.user_id == bot.user.id:
         return
     guild = bot.get_guild(payload.guild_id)
     if not guild:
+        return
+    channel = guild.get_channel(payload.channel_id)
+    if not channel or channel.name != "rôles":
+        return
+    emoji = str(payload.emoji)
+    role_name = EMOJI_ROLE_MAP.get(emoji)
+    if not role_name:
         return
     role = discord.utils.get(guild.roles, name=role_name)
     member = guild.get_member(payload.user_id)
@@ -138,16 +145,16 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
 
 @bot.event
 async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
-    """Retire un rôle quand un membre enlève sa réaction."""
-    msg_id = str(payload.message_id)
-    if msg_id not in REACTION_ROLES:
-        return
-    emoji = str(payload.emoji)
-    role_name = REACTION_ROLES[msg_id].get(emoji)
-    if not role_name:
-        return
+    """Retire un rôle quand un membre enlève sa réaction dans #rôles."""
     guild = bot.get_guild(payload.guild_id)
     if not guild:
+        return
+    channel = guild.get_channel(payload.channel_id)
+    if not channel or channel.name != "rôles":
+        return
+    emoji = str(payload.emoji)
+    role_name = EMOJI_ROLE_MAP.get(emoji)
+    if not role_name:
         return
     role = discord.utils.get(guild.roles, name=role_name)
     member = guild.get_member(payload.user_id)
