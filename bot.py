@@ -7,21 +7,26 @@ Fonctionnalités :
   - Rôles par réaction automatiques
   - Message de bienvenue + auto-rôle Nouveau
   - Logs de modération
+  - Notifications Twitch automatiques
 
-Dépendances : pip install discord.py
+Dépendances : pip install discord.py aiohttp
 Python : 3.8+
 """
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 import json
 import os
+import aiohttp
 from datetime import datetime, timedelta
 
 # ─── CONFIG — à modifier ──────────────────────────────────────────────────────
 
-TOKEN = os.environ.get("DISCORD_TOKEN", "VOTRE_TOKEN_ICI")          # Token du bot (Discord Developer Portal)
+TOKEN = os.environ.get("DISCORD_TOKEN", "VOTRE_TOKEN_ICI")
+TWITCH_CLIENT_ID = os.environ.get("TWITCH_CLIENT_ID", "ufmytitwt42r3ttlsxislzf9xh44pa")
+TWITCH_CLIENT_SECRET = os.environ.get("TWITCH_CLIENT_SECRET", "g8384v1lt0fcobkhvj6pkmzab7i003")
+TWITCH_CHANNEL_NAME = "lives-twitch"          # Token du bot (Discord Developer Portal)
 GUILD_ID = None                    # ID de votre serveur pour sync instantanée (int), ou None (global, ~1h)
 LOG_CHANNEL_NAME = "logs-modération"
 
@@ -38,6 +43,49 @@ intents.members = True
 intents.reactions = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+# ─── TWITCH (stockage JSON local) ────────────────────────────────────────────
+
+TWITCH_FILE = "twitch.json"
+twitch_token = None
+live_streamers = set()  # streamers actuellement en live (pour éviter les doublons)
+
+def load_twitch() -> dict:
+    if os.path.exists(TWITCH_FILE):
+        with open(TWITCH_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}  # { discord_user_id: twitch_username }
+
+def save_twitch(data: dict):
+    with open(TWITCH_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+async def get_twitch_token() -> str:
+    global twitch_token
+    async with aiohttp.ClientSession() as session:
+        resp = await session.post(
+            "https://id.twitch.tv/oauth2/token",
+            params={
+                "client_id": TWITCH_CLIENT_ID,
+                "client_secret": TWITCH_CLIENT_SECRET,
+                "grant_type": "client_credentials"
+            }
+        )
+        data = await resp.json()
+        twitch_token = data.get("access_token")
+    return twitch_token
+
+async def check_twitch_live(usernames: list) -> list:
+    """Retourne la liste des streamers actuellement en live avec leurs infos."""
+    if not usernames:
+        return []
+    token = await get_twitch_token()
+    headers = {"Client-ID": TWITCH_CLIENT_ID, "Authorization": f"Bearer {token}"}
+    params = [("user_login", u) for u in usernames]
+    async with aiohttp.ClientSession() as session:
+        resp = await session.get("https://api.twitch.tv/helix/streams", headers=headers, params=params)
+        data = await resp.json()
+        return data.get("data", [])
 
 # ─── WARNINGS (stockage JSON local) ──────────────────────────────────────────
 
@@ -78,10 +126,50 @@ async def log_action(guild: discord.Guild, action: str, moderator: discord.Membe
 
 # ─── EVENTS ──────────────────────────────────────────────────────────────────
 
+@tasks.loop(minutes=5)
+async def check_streams():
+    """Vérifie toutes les 5 minutes si des membres streament sur Twitch."""
+    global live_streamers
+    twitch_data = load_twitch()
+    if not twitch_data:
+        return
+
+    usernames = list(twitch_data.values())
+    live_list = await check_twitch_live(usernames)
+    currently_live = {s["user_login"].lower() for s in live_list}
+
+    for guild in bot.guilds:
+        channel = discord.utils.get(guild.text_channels, name=TWITCH_CHANNEL_NAME)
+        if not channel:
+            continue
+
+        # Notifier les nouveaux streamers (pas encore annoncés)
+        for stream in live_list:
+            username = stream["user_login"].lower()
+            if username not in live_streamers:
+                embed = discord.Embed(
+                    title=f"🔴 {stream['user_name']} est en live !",
+                    description=f"**{stream['title']}**",
+                    color=discord.Color.purple(),
+                    url=f"https://twitch.tv/{stream['user_login']}"
+                )
+                embed.add_field(name="🎮 Jeu", value=stream.get("game_name", "Inconnu"), inline=True)
+                embed.add_field(name="👥 Viewers", value=stream.get("viewer_count", 0), inline=True)
+                embed.set_footer(text="Twitch • Live maintenant")
+                await channel.send(embed=embed)
+
+    # Mettre à jour les streamers en live
+    live_streamers = currently_live
+
+@check_streams.before_loop
+async def before_check():
+    await bot.wait_until_ready()
+
 @bot.event
 async def on_ready():
     print(f"✅ Connecté : {bot.user} (ID: {bot.user.id})")
     await bot.change_presence(activity=discord.Game(name="🎮 Gaming Community"))
+    check_streams.start()
     try:
         if GUILD_ID:
             guild_obj = discord.Object(id=GUILD_ID)
@@ -160,6 +248,46 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
     member = guild.get_member(payload.user_id)
     if role and member:
         await member.remove_roles(role)
+
+# ─── COMMANDES TWITCH ────────────────────────────────────────────────────────
+
+@bot.tree.command(name="addtwitch", description="Enregistre ton pseudo Twitch pour les notifs de live")
+@app_commands.describe(pseudo="Ton nom d'utilisateur Twitch")
+async def addtwitch(interaction: discord.Interaction, pseudo: str):
+    data = load_twitch()
+    data[str(interaction.user.id)] = pseudo.lower()
+    save_twitch(data)
+    embed = discord.Embed(
+        description=f"✅ Ton Twitch **{pseudo}** est enregistré ! Le serveur sera notifié quand tu seras en live 🔴",
+        color=discord.Color.purple()
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="removetwitch", description="Retire ton pseudo Twitch des notifs")
+async def removetwitch(interaction: discord.Interaction):
+    data = load_twitch()
+    uid = str(interaction.user.id)
+    if uid in data:
+        pseudo = data.pop(uid)
+        save_twitch(data)
+        await interaction.response.send_message(f"✅ **{pseudo}** retiré des notifs de live.", ephemeral=True)
+    else:
+        await interaction.response.send_message("❌ Tu n'as pas de Twitch enregistré.", ephemeral=True)
+
+@bot.tree.command(name="liststreamers", description="Voir les streamers enregistrés [MOD]")
+@app_commands.checks.has_any_role("Admin", "Modérateur")
+async def liststreamers(interaction: discord.Interaction):
+    data = load_twitch()
+    if not data:
+        await interaction.response.send_message("Aucun streamer enregistré.", ephemeral=True)
+        return
+    lines = []
+    for uid, username in data.items():
+        member = interaction.guild.get_member(int(uid))
+        name = member.display_name if member else f"ID:{uid}"
+        lines.append(f"🎮 **{name}** → [twitch.tv/{username}](https://twitch.tv/{username})")
+    embed = discord.Embed(title="📋 Streamers enregistrés", description="\n".join(lines), color=discord.Color.purple())
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # ─── COMMANDES GÉNÉRALES ─────────────────────────────────────────────────────
 
